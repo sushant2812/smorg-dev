@@ -184,3 +184,17 @@ class SupportsProgress(Protocol):
         IntegrationError, never anything else.
         """
         ...
+
+
+@runtime_checkable
+class SupportsSearch(Protocol):
+    """An integration whose panel can search on demand. Optional: the shell isinstance-checks
+    before running, so an integration without search simply never defines search.
+    """
+
+    def search(self, credentials: Credentials, http: httpx.Client, query: str) -> object:
+        """Results for `query`, in whatever shape this integration's panel renders. The shell
+        never inspects it. A read: it returns data and never mutates a service. Raises
+        IntegrationError, never anything else.
+        """
+        ...

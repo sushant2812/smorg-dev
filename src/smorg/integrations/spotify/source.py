@@ -27,8 +27,12 @@ PLAYER_ENDPOINT = "https://api.spotify.com/v1/me/player"
 QUEUE_ENDPOINT = "https://api.spotify.com/v1/me/player/queue"
 RECENTLY_PLAYED_ENDPOINT = "https://api.spotify.com/v1/me/player/recently-played"
 PLAYLISTS_ENDPOINT = "https://api.spotify.com/v1/playlists"
+SEARCH_ENDPOINT = "https://api.spotify.com/v1/search"
 
 LAST_PLAYED_LIMIT = 1
+# Per result type, so up to 5 songs + 5 albums + 5 playlists — enough to find and open something
+# without turning the picker into a browse-deep list.
+SEARCH_LIMIT = 5
 
 # Where "o" opens when nothing is loaded on the player at all.
 FALLBACK_URL = "https://open.spotify.com"
@@ -40,6 +44,32 @@ class Track:
     artists: tuple[str, ...]
     album: str
     url: str
+
+
+@dataclass(frozen=True)
+class Album:
+    name: str
+    artists: tuple[str, ...]
+    url: str
+
+
+@dataclass(frozen=True)
+class Playlist:
+    name: str
+    owner: str
+    url: str
+
+
+# One hit in a search: a song, an album, or a playlist. Each carries only what the picker shows
+# and the url to open in Spotify — no playback uri, since search only reads and opens.
+SearchItem = Track | Album | Playlist
+
+
+@dataclass(frozen=True)
+class SearchResults:
+    """A flat, Spotify-style mix of hits (not grouped by type)."""
+
+    items: tuple[SearchItem, ...]
 
 
 @dataclass(frozen=True)
@@ -87,6 +117,29 @@ def fetch(credentials: Credentials, http: httpx.Client) -> tuple[PlayerState, ..
         last_played=last_played,
     )
     return (state,)
+
+
+def search(credentials: Credentials, http: httpx.Client, query: str) -> SearchResults:
+    """Songs, albums, and playlists matching `query`, interleaved into one flat list. A read: it
+    finds things to open in Spotify and never touches playback.
+    """
+    stripped = query.strip()
+    if not stripped:
+        # Refuse before any network call. Base IntegrationError, not Malformed: an empty query is
+        # a caller precondition, not Spotify returning junk. The panel guards this upstream too.
+        raise IntegrationError("search query was empty")
+    response = _get(
+        credentials,
+        http,
+        SEARCH_ENDPOINT,
+        params={"q": stripped, "type": "track,album,playlist", "limit": SEARCH_LIMIT},
+    )
+    _require_ok(response)
+    payload = _json_object(response)
+    tracks = _tracks_from_search(payload)
+    albums = _albums_from_search(payload)
+    playlists = _playlists_from_search(payload)
+    return SearchResults(items=_interleave(tracks, albums, playlists))
 
 
 def _get(
@@ -265,3 +318,82 @@ def _album_name(track: dict[str, Any]) -> str:
     if not isinstance(album, dict):
         raise Malformed(f"'album' was {type(album).__name__}, expected an object")
     return required_string(album, "name")
+
+
+def _interleave(*groups: tuple[SearchItem, ...]) -> tuple[SearchItem, ...]:
+    """Round-robin across type buckets so the list feels mixed, not sectioned."""
+    items: list[SearchItem] = []
+    depth = max((len(group) for group in groups), default=0)
+    for index in range(depth):
+        for group in groups:
+            if index < len(group):
+                items.append(group[index])
+    return tuple(items)
+
+
+def _tracks_from_search(payload: dict[str, Any]) -> tuple[Track, ...]:
+    return tuple(_track_of(raw) for raw in _search_items(payload, "tracks", "search hit"))
+
+
+def _albums_from_search(payload: dict[str, Any]) -> tuple[Album, ...]:
+    return tuple(_album_of(raw) for raw in _search_items(payload, "albums", "album hit"))
+
+
+def _playlists_from_search(payload: dict[str, Any]) -> tuple[Playlist, ...]:
+    return tuple(_playlist_of(raw) for raw in _search_items(payload, "playlists", "playlist hit"))
+
+
+def _search_items(payload: dict[str, Any], key: str, label: str) -> list[dict[str, Any]]:
+    """The non-null object items under one search bucket. A missing bucket is empty, not an error;
+    Spotify sometimes pads playlist results with nulls, which are skipped.
+    """
+    block = payload.get(key)
+    if block is None:
+        return []
+    if not isinstance(block, dict):
+        raise Malformed(f"'{key}' was not an object")
+    raw_items = block.get("items")
+    if not isinstance(raw_items, list):
+        raise Malformed(f"'{key}.items' was missing or not a list")
+    items: list[dict[str, Any]] = []
+    for raw in raw_items:
+        if raw is None:
+            continue
+        if not isinstance(raw, dict):
+            raise Malformed(f"a {label} was {type(raw).__name__}, expected an object")
+        items.append(raw)
+    return items
+
+
+def _album_of(raw: dict[str, Any]) -> Album:
+    return Album(
+        name=sanitize_line(required_string(raw, "name")),
+        artists=_artists_of(raw),
+        url=_external_spotify_url(raw, "album"),
+    )
+
+
+def _playlist_of(raw: dict[str, Any]) -> Playlist:
+    owner = raw.get("owner")
+    if not isinstance(owner, dict):
+        raise Malformed(f"'owner' was {type(owner).__name__}, expected an object")
+    # Spotify's owner.display_name is nullable; fall back to the id (always present) so one
+    # nameless owner can't fail the whole search over a cosmetic field.
+    owner_name = owner.get("display_name") or owner.get("id") or "Spotify"
+    if not isinstance(owner_name, str):
+        owner_name = "Spotify"
+    return Playlist(
+        name=sanitize_line(required_string(raw, "name")),
+        owner=sanitize_line(owner_name),
+        url=_external_spotify_url(raw, "playlist"),
+    )
+
+
+def _external_spotify_url(raw: dict[str, Any], kind: str) -> str:
+    external_urls = raw.get("external_urls")
+    if not isinstance(external_urls, dict):
+        raise Malformed(f"'external_urls' was {type(external_urls).__name__}, expected an object")
+    url = required_string(external_urls, "spotify")
+    if urlsplit(url).scheme != "https":
+        raise Malformed(f"a {kind}'s Spotify url was not https")
+    return url

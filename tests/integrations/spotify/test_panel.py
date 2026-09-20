@@ -12,9 +12,10 @@ from smorg.integrations.spotify.source import (
     LastPlayed,
     NowPlaying,
     PlayerState,
+    SearchResults,
     Track,
 )
-from smorg.shell.panel import PanelState
+from smorg.shell.panel import Panel, PanelState
 
 NOW = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
 
@@ -311,3 +312,96 @@ async def test_escape_is_a_no_op_when_the_search_strip_is_not_showing():
         await pilot.pause()
 
         assert panel.query_one("#player-search", Input).display is False
+
+
+# --- Search (read-only: find and open in Spotify) ---
+
+
+class _RecordingHarness(_SpotifyPanelHarness):
+    """Stands in for the shell, recording the read-only search requests the panel posts."""
+
+    def __init__(self, panel: SpotifyPanel) -> None:
+        super().__init__(panel)
+        self.searches: list[str] = []
+
+    def on_panel_search_requested(self, message: Panel.SearchRequested) -> None:
+        self.searches.append(message.query)
+
+
+@pytest.mark.asyncio
+async def test_pressing_slash_opens_the_search_strip_with_the_search_placeholder():
+    panel = panel_with(state(now_playing()))
+    async with _SpotifyPanelHarness(panel).run_test() as pilot:
+        panel.focus()
+        await pilot.pause()
+        await pilot.press("slash")
+        await pilot.pause()
+
+        search = panel.query_one("#player-search", Input)
+        assert search.display is True
+        assert search.placeholder == "search Spotify — songs, albums, playlists"
+        assert search.has_focus
+
+
+@pytest.mark.asyncio
+async def test_submitting_a_search_posts_a_read_only_search_request_and_closes_the_strip():
+    panel = panel_with(state(now_playing()))
+    app = _RecordingHarness(panel)
+    async with app.run_test() as pilot:
+        panel.focus()
+        await pilot.pause()
+        await pilot.press("slash")
+        await pilot.pause()
+        panel.query_one("#player-search", Input).value = "  brightside  "
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert panel.query_one("#player-search", Input).display is False
+
+    assert app.searches == ["brightside"]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_search_query_warns_and_posts_nothing(monkeypatch):
+    notified: list[str] = []
+    monkeypatch.setattr(
+        "smorg.integrations.spotify.panel.SpotifyPanel.notify",
+        lambda self, message, **kwargs: notified.append(message),
+    )
+    panel = panel_with(state(now_playing()))
+    app = _RecordingHarness(panel)
+    async with app.run_test() as pilot:
+        panel.focus()
+        await pilot.pause()
+        await pilot.press("slash")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert app.searches == []
+    assert any("enter a search query" in message for message in notified)
+
+
+@pytest.mark.asyncio
+async def test_choosing_a_search_hit_opens_it_in_spotify(monkeypatch):
+    opened: list[str] = []
+    monkeypatch.setattr(
+        "smorg.integrations.spotify.panel.webbrowser.open", lambda url: opened.append(url)
+    )
+    hit = Track(
+        track="Mr. Brightside",
+        artists=("The Killers",),
+        album="Hot Fuss",
+        url="https://open.spotify.com/track/3n3Ppam7vgaVa1iaRUc9Lp",
+    )
+    panel = panel_with(state(now_playing()))
+    async with _SpotifyPanelHarness(panel).run_test(size=(120, 40)) as pilot:
+        panel.focus()
+        await pilot.pause()
+        # Stand in for the shell handing back results, then choose the highlighted hit.
+        panel._on_search_ready(SearchResults(items=(hit,)))
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert opened == [hit.url]

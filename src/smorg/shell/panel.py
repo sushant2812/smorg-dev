@@ -114,6 +114,26 @@ class Panel(Vertical):
             self.panel = panel
             self.item = item
 
+    class SearchRequested(Message):
+        """A panel's request to search, carrying the query and the callbacks to answer on.
+
+        Like DetailRequested, it holds no credentials and does no I/O: the shell reads
+        `query`, runs the search, and calls `on_ready` with results or `on_error` with a message.
+        """
+
+        def __init__(
+            self,
+            panel: Panel,
+            query: str,
+            on_ready: Callable[[object], None],
+            on_error: Callable[[str], None],
+        ) -> None:
+            super().__init__()
+            self.panel = panel
+            self.query = query
+            self.on_ready = on_ready
+            self.on_error = on_error
+
     DEFAULT_CSS = """
     Panel > #body { height: 1fr; }
     """

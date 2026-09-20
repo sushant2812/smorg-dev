@@ -10,11 +10,15 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.widgets import Input
 
+from smorg.integrations.spotify.pickers import search_picker
 from smorg.integrations.spotify.source import (
     FALLBACK_URL,
+    Album,
     LastPlayed,
     NowPlaying,
     PlayerState,
+    Playlist,
+    SearchResults,
     Track,
 )
 from smorg.shell.format import age
@@ -33,11 +37,21 @@ _ROW_INDENT = "      "
 
 _PLAY_NOW_PLACEHOLDER = "play now — search (not implemented yet)"
 _ADD_TO_QUEUE_PLACEHOLDER = "add to queue — search (not implemented yet)"
+_SEARCH_PLACEHOLDER = "search Spotify — songs, albums, playlists"
 
 
 def _format_artists(artists: tuple[str, ...]) -> str:
     """("Tame Impala", "Kevin Parker") -> "Tame Impala, Kevin Parker" """
     return ", ".join(artists)
+
+
+def _hit_label(item: Track | Album | Playlist) -> str:
+    """How a chosen search hit reads in the "opening …" toast."""
+    if isinstance(item, Track):
+        return f"{item.track} · {_format_artists(item.artists)}"
+    if isinstance(item, Album):
+        return f"{item.name} · {_format_artists(item.artists)}"
+    return f"{item.name} · {item.owner}"
 
 
 def _format_track(track: Track) -> Text:
@@ -109,10 +123,17 @@ class SpotifyPanel(Panel):
 
     BINDINGS = [
         Binding("o", "open", "open in Spotify", show=False),
+        Binding("slash", "search", "search", show=False),
         Binding("p", "play_now", "play now", show=False),
         Binding("a", "add_to_queue", "add to queue", show=False),
     ]
     can_focus = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        # True while the search strip is a real search; False while it is a play/queue stub. Set
+        # on open and cleared on close, so on_input_submitted knows which flow submitted.
+        self._search_mode = False
 
     def compose(self) -> ComposeResult:
         yield from super().compose()
@@ -155,10 +176,16 @@ class SpotifyPanel(Panel):
         else:
             webbrowser.open(state.url)
 
+    def action_search(self) -> None:
+        self._search_mode = True
+        self._open_search(_SEARCH_PLACEHOLDER)
+
     def action_play_now(self) -> None:
+        self._search_mode = False
         self._open_search(_PLAY_NOW_PLACEHOLDER)
 
     def action_add_to_queue(self) -> None:
+        self._search_mode = False
         self._open_search(_ADD_TO_QUEUE_PLACEHOLDER)
 
     def _open_search(self, placeholder: str) -> None:
@@ -172,6 +199,7 @@ class SpotifyPanel(Panel):
         search = self.query_one("#player-search", Input)
         search.display = False
         search.value = ""
+        self._search_mode = False
         self.focus()
 
     def on_key(self, event: events.Key) -> None:
@@ -186,5 +214,43 @@ class SpotifyPanel(Panel):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         event.stop()
-        self.notify("not implemented yet — coming with write permissions")
+        query = event.value.strip()
+        searching = self._search_mode
         self._close_search()
+        if not searching:
+            self.notify("not implemented yet — coming with write permissions")
+            return
+        if not query:
+            self.notify("enter a search query", severity="warning")
+            return
+        self.post_message(
+            Panel.SearchRequested(
+                self,
+                query,
+                on_ready=self._on_search_ready,
+                on_error=self._on_search_failed,
+            )
+        )
+
+    def _on_search_ready(self, result: object) -> None:
+        if not isinstance(result, SearchResults):
+            self.notify("search failed", severity="error")
+            self.focus()
+            return
+        if not result.items:
+            self.notify("no matches", severity="warning")
+            self.focus()
+            return
+        self.app.push_screen(search_picker(result), self._on_pick)
+
+    def _on_search_failed(self, message: str) -> None:
+        self.notify(message, severity="error")
+        self.focus()
+
+    def _on_pick(self, chosen: object) -> None:
+        if not isinstance(chosen, Track | Album | Playlist):
+            self.focus()
+            return
+        webbrowser.open(chosen.url)
+        self.notify(f"opening {_hit_label(chosen)}")
+        self.focus()

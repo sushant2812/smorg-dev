@@ -19,7 +19,7 @@ from textual.widgets._tabbed_content import ContentTab
 
 from smorg import __version__, is_dev_build
 from smorg.auth.refresh import credentials_for
-from smorg.auth.store import CredentialStoreError, now
+from smorg.auth.store import Credentials, CredentialStoreError, now
 from smorg.core.config import TabConfig, resolve_connection
 from smorg.core.contract import (
     Action,
@@ -30,6 +30,7 @@ from smorg.core.contract import (
     Malformed,
     SupportsDetail,
     SupportsProgress,
+    SupportsSearch,
 )
 from smorg.core.keys import SHELL_KEYS
 from smorg.core.registry import UnknownIntegration, get_integration
@@ -461,25 +462,75 @@ class SmorgApp(App[None]):
         if not isinstance(integration, SupportsDetail):
             self.call_from_thread(panel.show_detail_error, key, "this tab has no detail view")
             return
+        self._read_off_thread(
+            integration,
+            integration_id,
+            lambda credentials, http: integration.fetch_detail(credentials, http, item),
+            on_ready=lambda detail: panel.show_detail(key, detail),
+            on_error=lambda message: panel.show_detail_error(key, message),
+        )
+
+    def on_panel_search_requested(self, message: Panel.SearchRequested) -> None:
+        # Only the focused panel of the visible tab can post this, so the active tab names the
+        # integration to search.
+        if self.active_tab:
+            self.run_search(self.active_tab, message)
+
+    @work(thread=True)
+    def run_search(self, integration_id: str, message: Panel.SearchRequested) -> None:
+        """Run one search off the UI thread; results answer on the message's callbacks. A read:
+        it resolves credentials and returns data, and never mutates a service.
+        """
+        try:
+            integration = get_integration(integration_id)
+        except UnknownIntegration:
+            # Same as fetch_detail: the active tab is always a real integration, so this is
+            # unreachable in practice — return quietly rather than invent a credentials message.
+            return
+        if not isinstance(integration, SupportsSearch):
+            self.call_from_thread(message.on_error, "this tab has no search")
+            return
+        self._read_off_thread(
+            integration,
+            integration_id,
+            lambda credentials, http: integration.search(credentials, http, message.query),
+            on_ready=message.on_ready,
+            on_error=message.on_error,
+        )
+
+    def _read_off_thread(
+        self,
+        integration: Integration,
+        integration_id: str,
+        read: Callable[[Credentials, httpx.Client], object],
+        on_ready: Callable[[object], None],
+        on_error: Callable[[str], None],
+    ) -> None:
+        """Shared body of the on-demand read workers (`fetch_detail`, `run_search`). Runs on the
+        caller's worker thread: resolve the connection, open an http client, settle credentials,
+        and call `read(credentials, http)`. The outcome is marshalled back to the UI thread —
+        `on_ready(result)` on success, or `on_error(message)` with a mapped message on any
+        connection, credential, or fetch failure. The caller has already looked the integration
+        up and confirmed it supports the operation.
+        """
         try:
             path, client_id = resolve_connection(
                 integration.manifest, self._tab_configs.get(integration_id)
             )
         except ValueError as error:
-            self.call_from_thread(panel.show_detail_error, key, str(error))
+            self.call_from_thread(on_error, str(error))
             return
         try:
             with httpx.Client(timeout=30) as http:
                 credentials = credentials_for(integration_id, path, client_id, http)
                 if credentials is None:
-                    self.call_from_thread(panel.show_detail_error, key, "not connected")
+                    self.call_from_thread(on_error, "not connected")
                     return
-                detail = integration.fetch_detail(credentials, http, item)
+                result = read(credentials, http)
         except (CredentialStoreError, IntegrationError) as error:
-            message = _format_fetch_error(error, integration_id)
-            self.call_from_thread(panel.show_detail_error, key, message)
+            self.call_from_thread(on_error, _format_fetch_error(error, integration_id))
             return
-        self.call_from_thread(panel.show_detail, key, detail)
+        self.call_from_thread(on_ready, result)
 
     @work(thread=True)
     def refresh_tab(

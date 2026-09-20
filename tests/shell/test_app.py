@@ -845,6 +845,111 @@ async def test_an_integration_without_fetch_detail_reports_no_detail_view(monkey
     assert panel._detail_errors[key] == "this tab has no detail view"
 
 
+# --- The shell brokers searches (read-only) ---
+
+
+class _SearchIntegration:
+    def __init__(self, results: object = ("hit",)) -> None:
+        self.manifest = _fake_manifest()
+        self.panel_class = LinearPanel
+        self._results = results
+        self.queries: list[str] = []
+
+    def fetch(self, credentials, http):
+        return ()
+
+    def search(self, credentials, http, query):
+        self.queries.append(query)
+        return self._results
+
+
+async def _search(app, pilot, query: str = "brightside") -> tuple[list[object], list[str]]:
+    """Post a search request the way a panel would, and collect what the worker answers with."""
+    ready: list[object] = []
+    errors: list[str] = []
+    panel = app.query_one(LinearPanel)
+    panel.post_message(
+        Panel.SearchRequested(panel, query, on_ready=ready.append, on_error=errors.append)
+    )
+    await pilot.pause()
+    await pilot.app.workers.wait_for_complete()
+    await pilot.pause()
+    return ready, errors
+
+
+@pytest.mark.asyncio
+async def test_a_search_round_trips_results_to_on_ready(monkeypatch):
+    _stub_credentials(monkeypatch)
+    integration = _SearchIntegration(results=("a", "b"))
+    monkeypatch.setattr("smorg.shell.app.get_integration", lambda integration_id: integration)
+    app = SmorgApp(tabs=(TabConfig("linear"),))
+    async with app.run_test() as pilot:
+        await pilot.app.workers.wait_for_complete()
+        ready, errors = await _search(app, pilot, query="  wide load  ")
+
+    assert ready == [("a", "b")]
+    assert errors == []
+    # The active tab routed it, and the query reached the integration verbatim.
+    assert integration.queries == ["  wide load  "]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_search_maps_the_error_to_on_error(monkeypatch):
+    _stub_credentials(monkeypatch)
+
+    class _FailingSearch(_SearchIntegration):
+        def search(self, credentials, http, query):
+            raise Unavailable("spotify is down")
+
+    monkeypatch.setattr("smorg.shell.app.get_integration", lambda integration_id: _FailingSearch())
+    app = SmorgApp(tabs=(TabConfig("linear"),))
+    async with app.run_test() as pilot:
+        await pilot.app.workers.wait_for_complete()
+        ready, errors = await _search(app, pilot)
+
+    assert ready == []
+    assert errors == ["spotify is down"]
+
+
+@pytest.mark.asyncio
+async def test_a_search_without_credentials_reports_not_connected_and_never_runs(monkeypatch):
+    monkeypatch.setattr(
+        "smorg.shell.app.credentials_for",
+        lambda integration_id, path, client_id, http: None,
+    )
+    integration = _SearchIntegration()
+    monkeypatch.setattr("smorg.shell.app.get_integration", lambda integration_id: integration)
+    app = SmorgApp(tabs=(TabConfig("linear"),))
+    async with app.run_test() as pilot:
+        await pilot.app.workers.wait_for_complete()
+        ready, errors = await _search(app, pilot)
+
+    assert errors == ["not connected"]
+    assert integration.queries == []  # the search itself never ran
+
+
+@pytest.mark.asyncio
+async def test_a_tab_whose_integration_has_no_search_reports_so(monkeypatch):
+    _stub_credentials(monkeypatch)
+
+    class _NoSearch:
+        def __init__(self) -> None:
+            self.manifest = _fake_manifest()
+            self.panel_class = LinearPanel
+
+        def fetch(self, credentials, http):
+            return ()
+
+    monkeypatch.setattr("smorg.shell.app.get_integration", lambda integration_id: _NoSearch())
+    app = SmorgApp(tabs=(TabConfig("linear"),))
+    async with app.run_test() as pilot:
+        await pilot.app.workers.wait_for_complete()
+        ready, errors = await _search(app, pilot)
+
+    assert ready == []
+    assert errors == ["this tab has no search"]
+
+
 # --- The detail cache is pruned as items refresh, so it cannot grow forever ---
 
 

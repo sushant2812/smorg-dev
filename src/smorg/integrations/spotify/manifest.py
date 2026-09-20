@@ -13,7 +13,7 @@ from smorg.auth.oauth import OAuthMethod, ServerMetadata, StaticProvider
 from smorg.auth.store import Credentials
 from smorg.core.contract import Action, ActionClass, AuthPath, Manifest
 from smorg.integrations.spotify.panel import SpotifyPanel
-from smorg.integrations.spotify.source import PlayerState, fetch
+from smorg.integrations.spotify.source import PlayerState, SearchResults, fetch, search
 
 METHOD = OAuthMethod(
     provider=StaticProvider(
@@ -40,6 +40,7 @@ MANIFEST = Manifest(
     stale_after=timedelta(minutes=1),
     actions=(
         Action(id="open", label="Open in Spotify", key="o", action_class=ActionClass.LAUNCH),
+        Action(id="search", label="Search", key="slash", action_class=ActionClass.LAUNCH),
         Action(id="play_now", label="Play now", key="p", action_class=ActionClass.REMOTE),
         Action(id="add_to_queue", label="Add to queue", key="a", action_class=ActionClass.REMOTE),
     ),
@@ -53,6 +54,9 @@ class SpotifyIntegration:
 
     def fetch(self, credentials: Credentials, http: httpx.Client) -> tuple[PlayerState, ...]:
         return fetch(credentials, http)
+
+    def search(self, credentials: Credentials, http: httpx.Client, query: str) -> SearchResults:
+        return search(credentials, http, query)
 
 
 INTEGRATION = SpotifyIntegration()
